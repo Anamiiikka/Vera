@@ -44,6 +44,13 @@ class NgrokBypassMiddleware(BaseHTTPMiddleware):
 
 app.add_middleware(NgrokBypassMiddleware)
 
+@app.get("/")
+async def root():
+    return {
+        "status": "Vera AI Bot Server is running!",
+        "endpoints": ["/v1/healthz", "/v1/metadata", "/v1/context", "/v1/tick", "/v1/reply"]
+    }
+
 START_TIME = time.time()
 
 # ── In-memory state ───────────────────────────────────────────────────────────
