@@ -111,6 +111,7 @@ CORE RULES:
 8. For customer-facing messages (recall, lapsed, appointment): send_as = "merchant_on_behalf".
 9. For merchant-facing messages: send_as = "vera".
 10. Do NOT use service+percentage discounts ("20% off"). Use service+price ("Dental Cleaning @ ₹299").
+11. WHY NOW: in one clause, tie the message to the trigger's concrete consequence/benefit of acting now (state it plainly, once — do not over-sell). Match the category voice; for clinical categories (dentists, pharmacies) stay restrained — compulsion comes from the specific FACT, not adjectives.
 
 OUTPUT FORMAT — respond ONLY with valid JSON, no markdown:
 {
