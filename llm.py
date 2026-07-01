@@ -143,16 +143,29 @@ def _call_gemini(system: str, user: str, model: str, temp: float, max_tokens: in
         key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY", "")
         _clients["gemini"] = genai.Client(api_key=key)
     client = _clients["gemini"]
-    resp = client.models.generate_content(
-        model=model,
-        contents=user,
-        config=types.GenerateContentConfig(
-            system_instruction=system,
-            temperature=temp,
-            max_output_tokens=max_tokens,
-            response_mime_type="application/json",
-        ),
+
+    # Gemini 2.5+ are "thinking" models: reasoning tokens count against the output
+    # budget, so a small cap can starve the actual answer (empty text). For this
+    # short, deterministic copy task we disable thinking; if a model requires it,
+    # fall back to no thinking_config but with generous headroom.
+    base = dict(
+        system_instruction=system,
+        temperature=temp,
+        max_output_tokens=max(max_tokens, 2048),
+        response_mime_type="application/json",
     )
+    try:
+        resp = client.models.generate_content(
+            model=model,
+            contents=user,
+            config=types.GenerateContentConfig(
+                **base, thinking_config=types.ThinkingConfig(thinking_budget=0)
+            ),
+        )
+    except Exception:
+        resp = client.models.generate_content(
+            model=model, contents=user, config=types.GenerateContentConfig(**base)
+        )
     return resp.text or ""
 
 

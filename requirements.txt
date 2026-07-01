@@ -8,5 +8,4 @@ python-dotenv>=1.0.0
 # Safe to keep installed; Groq stays the default and these stay dormant.
 openai>=1.30.0
 anthropic>=0.40.0
-# Gemini (uncomment if LLM_PROVIDER=gemini):
-# google-genai>=0.3.0
+google-genai>=0.3.0
