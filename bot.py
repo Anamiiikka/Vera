@@ -63,6 +63,12 @@ contexts: dict[tuple[str, str], dict] = {}
 # conversation_id → ConversationState
 conversations: dict[str, ConversationState] = {}
 
+# merchant_id/customer_id → count of auto-reply-looking messages this session.
+# A merchant's WhatsApp Business auto-reply fires the same canned text across
+# separate conversations (each with a fresh conversation_id), so per-conversation
+# counting alone never trips. We track it per-party too, and exit after one retry.
+auto_reply_hits: dict[str, int] = {}
+
 # suppression_key → True  (already sent in this session)
 sent_suppression: set[str] = set()
 
@@ -329,6 +335,15 @@ async def reply(body: ReplyBody):
     # Routing decision (no LLM needed for clear-cut cases)
     decision = decide_on_reply(conv_state, body.message)
 
+    # Cross-conversation auto-reply escalation: if this party has already sent an
+    # auto-reply earlier this session (possibly under a different conversation_id),
+    # don't retry again — exit gracefully.
+    if decision["decision"] in ("auto_reply_retry", "close_after_retry"):
+        party_key = merchant_id or customer_id or conv_id
+        auto_reply_hits[party_key] = auto_reply_hits.get(party_key, 0) + 1
+        if auto_reply_hits[party_key] >= 2:
+            decision = {"decision": "close_after_retry"}
+
     if decision["decision"] == "exit":
         conv_state.transition(ConvState.CLOSED)
         exit_msg = graceful_exit_message(lang)
@@ -421,6 +436,7 @@ async def teardown():
     contexts.clear()
     conversations.clear()
     sent_suppression.clear()
+    auto_reply_hits.clear()
     return {"status": "wiped"}
 
 
