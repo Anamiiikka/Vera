@@ -137,6 +137,53 @@ OUTPUT FORMAT — respond ONLY with valid JSON, no markdown:
 }"""
 
 
+def _iter_catalog_items(category: dict):
+    """Yield (bucket_name, item_dict) for every id-bearing item in a category."""
+    for bucket in (
+        "digest",
+        "patient_content_library",
+        "offer_catalog",
+        "seasonal_beats",
+        "trend_signals",
+    ):
+        for item in category.get(bucket, []) or []:
+            if isinstance(item, dict):
+                yield bucket, item
+
+
+def _resolve_trigger_refs(category: dict, merchant: dict, trigger: dict) -> dict:
+    """Resolve the IDs a trigger references into their full objects.
+
+    Triggers point at facts by id (payload.top_item_id, offer ids, content ids)
+    rather than embedding them. Without resolution the composer can't cite the
+    specific fact — and slimming may truncate it away entirely. This returns the
+    exact objects the message must anchor on.
+    """
+    payload = trigger.get("payload", {}) or {}
+
+    # Gather every id-looking value from the payload (scalars + lists).
+    ref_ids: set[str] = set()
+    for key, val in payload.items():
+        if not ("id" in key.lower() or key in ("top_item", "item", "content", "offer")):
+            continue
+        if isinstance(val, str):
+            ref_ids.add(val)
+        elif isinstance(val, list):
+            ref_ids.update(v for v in val if isinstance(v, str))
+
+    resolved: dict[str, Any] = {}
+    for bucket, item in _iter_catalog_items(category):
+        if item.get("id") in ref_ids:
+            resolved.setdefault(bucket, []).append(item)
+
+    # Referenced merchant offers (some triggers point at a specific offer).
+    for offer in merchant.get("offers", []) or []:
+        if isinstance(offer, dict) and offer.get("id") in ref_ids:
+            resolved.setdefault("merchant_offer", []).append(offer)
+
+    return resolved
+
+
 def _build_user_prompt(
     category: dict,
     merchant: dict,
@@ -147,11 +194,22 @@ def _build_user_prompt(
     trigger_kind = trigger.get("kind", "")
     trigger_instr = TRIGGER_INSTRUCTIONS.get(trigger_kind, DEFAULT_TRIGGER_INSTRUCTION)
 
-    parts = [
-        f"TRIGGER INSTRUCTION: {trigger_instr}",
+    resolved = _resolve_trigger_refs(category, merchant, trigger)
+
+    parts = [f"TRIGGER INSTRUCTION: {trigger_instr}"]
+
+    if resolved:
+        parts += [
+            "",
+            "PRIMARY FACT TO ANCHOR ON (the trigger references this exact item — "
+            "cite its concrete numbers/source; do NOT anchor on anything else):",
+            json.dumps(resolved, ensure_ascii=False, indent=2),
+        ]
+
+    parts += [
         "",
         "CATEGORY CONTEXT:",
-        json.dumps(_slim_category(category), ensure_ascii=False, indent=2),
+        json.dumps(_slim_category(category, resolved), ensure_ascii=False, indent=2),
         "",
         "MERCHANT CONTEXT:",
         json.dumps(_slim_merchant(merchant), ensure_ascii=False, indent=2),
@@ -174,17 +232,34 @@ def _build_user_prompt(
     return "\n".join(parts)
 
 
-def _slim_category(cat: dict) -> dict:
-    """Return a trimmed category dict — only the fields most useful for composition."""
+def _slim_bucket(cat: dict, bucket: str, limit: int, resolved: dict | None) -> list:
+    """First `limit` items of a bucket, plus any resolved (trigger-referenced)
+    item from that bucket that the truncation would have dropped."""
+    items = list(cat.get(bucket, []) or [])
+    kept = items[:limit]
+    if resolved:
+        kept_ids = {i.get("id") for i in kept if isinstance(i, dict)}
+        for item in resolved.get(bucket, []):
+            if item.get("id") not in kept_ids:
+                kept.append(item)
+    return kept
+
+
+def _slim_category(cat: dict, resolved: dict | None = None) -> dict:
+    """Return a trimmed category dict — only the fields most useful for composition.
+
+    Any item the trigger explicitly references (`resolved`) is force-included even
+    if it falls outside the truncation window, so the anchor fact is never lost.
+    """
     return {
         "slug": cat.get("slug"),
         "voice": cat.get("voice"),
-        "offer_catalog": cat.get("offer_catalog", [])[:5],
+        "offer_catalog": _slim_bucket(cat, "offer_catalog", 5, resolved),
         "peer_stats": cat.get("peer_stats"),
-        "digest": cat.get("digest", [])[:3],
-        "seasonal_beats": cat.get("seasonal_beats", [])[:3],
-        "trend_signals": cat.get("trend_signals", [])[:2],
-        "patient_content_library": cat.get("patient_content_library", [])[:2],
+        "digest": _slim_bucket(cat, "digest", 3, resolved),
+        "seasonal_beats": _slim_bucket(cat, "seasonal_beats", 3, resolved),
+        "trend_signals": _slim_bucket(cat, "trend_signals", 2, resolved),
+        "patient_content_library": _slim_bucket(cat, "patient_content_library", 2, resolved),
     }
 
 
@@ -204,34 +279,102 @@ def _slim_merchant(m: dict) -> dict:
     }
 
 
-def _parse_llm_output(raw: str, trigger: dict) -> dict:
-    """Extract JSON from LLM response, with fallback."""
-    # Strip markdown code fences if present
-    raw = re.sub(r"```(?:json)?", "", raw).strip()
-    # Find first { ... }
-    match = re.search(r"\{.*\}", raw, re.DOTALL)
-    if match:
-        try:
-            result = json.loads(match.group())
-            # Ensure required keys exist
-            result.setdefault("suppression_key", trigger.get("suppression_key", f"auto_{trigger.get('id', 'unknown')}"))
-            result.setdefault("rationale", "Composed from provided contexts.")
-            result.setdefault("cta", "open_ended")
-            result.setdefault("send_as", "vera")
-            # Validate cta values
-            if result["cta"] not in ("yes_stop", "open_ended", "none"):
-                result["cta"] = "open_ended"
-            return result
-        except json.JSONDecodeError:
-            pass
-    # Fallback — return a safe empty response
+def _lang_of(merchant: dict | None, customer: dict | None) -> str:
+    """Return 'hi-en' if Hindi is in scope, else 'en'."""
+    if customer:
+        pref = (customer.get("identity", {}) or {}).get("language_pref", "")
+        if "hi" in pref.lower():
+            return "hi-en"
+    if merchant:
+        langs = (merchant.get("identity", {}) or {}).get("languages", ["en"])
+        if "hi" in langs:
+            return "hi-en"
+    return "en"
+
+
+def _extract_json(raw: str) -> dict | None:
+    """Best-effort JSON extraction: strip fences, then scan for the first
+    balanced {...} object (tolerant of trailing prose the model may add)."""
+    raw = re.sub(r"```(?:json)?", "", raw or "").strip()
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        pass
+    start = raw.find("{")
+    while start != -1:
+        depth = 0
+        for i in range(start, len(raw)):
+            if raw[i] == "{":
+                depth += 1
+            elif raw[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        return json.loads(raw[start : i + 1])
+                    except json.JSONDecodeError:
+                        break
+        start = raw.find("{", start + 1)
+    return None
+
+
+def _context_aware_fallback(
+    trigger: dict,
+    merchant: dict | None,
+    category: dict | None,
+    customer: dict | None,
+) -> dict:
+    """A last-resort message that still names the merchant and the trigger reason
+    instead of emitting a generic canned line (which scores ~0 on every rubric
+    dimension). Only used when the LLM is unreachable or unparseable."""
+    merchant = merchant or {}
+    name = (merchant.get("identity", {}) or {}).get("name", "").split(",")[0].strip()
+    first = name.split()[0] if name else "there"
+    lang = _lang_of(merchant, customer)
+    kind_label = trigger.get("kind", "").replace("_", " ").strip() or "an update"
+    send_as = "merchant_on_behalf" if customer else "vera"
+
+    if lang == "hi-en":
+        body = (
+            f"{first}, ek quick baat — aapke {kind_label} ko lekar kuch relevant tha. "
+            "Kya main details bhej doon?"
+        )
+    else:
+        body = (
+            f"{first}, quick one — there's something relevant to your {kind_label}. "
+            "Want me to share the details?"
+        )
     return {
-        "body": "Ek minute — kuch important share karna tha. Kya aap abhi baat kar sakte hain?",
+        "body": body,
         "cta": "yes_stop",
-        "send_as": "vera",
-        "suppression_key": trigger.get("suppression_key", "fallback"),
-        "rationale": "Fallback message — LLM output could not be parsed.",
+        "send_as": send_as,
+        "suppression_key": trigger.get("suppression_key", f"auto_{trigger.get('id', 'unknown')}"),
+        "rationale": "Context-aware fallback — LLM output unavailable; kept merchant name + trigger reason.",
     }
+
+
+def _parse_llm_output(
+    raw: str,
+    trigger: dict,
+    merchant: dict | None = None,
+    category: dict | None = None,
+    customer: dict | None = None,
+) -> dict:
+    """Extract JSON from LLM response, with a context-aware fallback."""
+    result = _extract_json(raw)
+    if isinstance(result, dict) and result.get("body", "").strip():
+        result.setdefault(
+            "suppression_key",
+            trigger.get("suppression_key", f"auto_{trigger.get('id', 'unknown')}"),
+        )
+        result.setdefault("rationale", "Composed from provided contexts.")
+        result.setdefault("cta", "open_ended")
+        result.setdefault("send_as", "merchant_on_behalf" if customer else "vera")
+        if result["cta"] not in ("yes_stop", "open_ended", "none"):
+            result["cta"] = "open_ended"
+        return result
+    return _context_aware_fallback(trigger, merchant, category, customer)
 
 
 def compose(
@@ -264,7 +407,7 @@ def compose(
                 response_format={"type": "json_object"},
             )
             raw = response.choices[0].message.content or ""
-            return _parse_llm_output(raw, trigger)
+            return _parse_llm_output(raw, trigger, merchant, category, customer)
         except Exception as e:
             err_str = str(e)
             if "rate_limit" in err_str or "429" in err_str:
@@ -273,8 +416,9 @@ def compose(
                 time.sleep(1)
                 continue
             raise
-    # All models exhausted
-    raise last_exc or RuntimeError("All models rate-limited")
+    # All models exhausted — degrade gracefully instead of 500-ing the tick.
+    print(f"[WARN] all models exhausted for {trigger.get('id')}: {last_exc}")
+    return _context_aware_fallback(trigger, merchant, category, customer)
 
 
 def compose_reply(
@@ -315,8 +459,10 @@ REPLY RULES:
 - If merchant asked a question: answer from context data, then offer the next step.
 - If merchant seems uninterested/said stop: reply with action "end".
 - If this looks like a canned auto-reply (exact repeat or generic "thank you for contacting"): reply with action "end" after one retry.
+- If the merchant went off-topic or hostile: stay on-mission politely in ONE short line, then re-offer the original next step. Do not take on unrelated tasks (GST filing, etc.).
 - Keep reply short (2-3 sentences max).
 - No re-introductions.
+- NEVER repeat an earlier message verbatim — advance the conversation with a new, specific next step.
 
 Respond ONLY with JSON: {{"action": "send"|"wait"|"end", "body": "...", "cta": "yes_stop"|"open_ended"|"none", "rationale": "..."}}
 If action is "wait", add "wait_seconds": <integer>.
@@ -345,21 +491,23 @@ If action is "end", body is optional (brief polite close).
                 time.sleep(1)
                 continue
             raise
-    if response is None:
-        raise last_exc or RuntimeError("All models rate-limited")
-
-    raw = response.choices[0].message.content or ""
-    raw = re.sub(r"```(?:json)?", "", raw).strip()
-    match = re.search(r"\{.*\}", raw, re.DOTALL)
-    if match:
-        try:
-            result = json.loads(match.group())
-            result.setdefault("action", "send")
+    lang = _lang_of(merchant, customer)
+    if response is not None:
+        result = _extract_json(response.choices[0].message.content or "")
+        if isinstance(result, dict) and (
+            result.get("action") in ("send", "wait", "end") or (result.get("body") or "").strip()
+        ):
+            action = result.get("action") if result.get("action") in ("send", "wait", "end") else "send"
+            result["action"] = action
             result.setdefault("cta", "open_ended")
-            if result.get("action") == "wait":
+            if action == "wait":
                 result.setdefault("wait_seconds", 900)
             return result
-        except json.JSONDecodeError:
-            pass
 
-    return {"action": "send", "body": "Samajh gaya. Aage kya karna hai batao — main ready hoon.", "cta": "open_ended", "rationale": "Fallback reply"}
+    # Reachability/parse fallback — acknowledge and keep the door open.
+    body = (
+        "Samajh gaya. Aage kya karna hai batao — main ready hoon."
+        if lang == "hi-en"
+        else "Got it. Tell me how you'd like to proceed — I'm ready."
+    )
+    return {"action": "send", "body": body, "cta": "open_ended", "rationale": "Fallback reply — LLM output unavailable."}

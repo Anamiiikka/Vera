@@ -6,13 +6,15 @@
 
 ### Composition Strategy
 
-Every `compose()` call goes through three layers:
+Every `compose()` call goes through four layers:
 
 1. **Trigger routing**: Each trigger `kind` (e.g., `research_digest`, `perf_dip`, `recall_due`) gets a specialized instruction block prepended to the prompt. This ensures the message anchors on the trigger's specific value rather than being generic.
 
-2. **Context slimming**: We inject only the most relevant fields from each context (not the entire JSON) to keep token count low and focus the LLM's attention on actionable signals — merchant CTR, active offers, conversation history, peer stats, category voice.
+2. **Reference resolution**: Triggers point at facts by id (`payload.top_item_id`, offer ids, content ids) rather than embedding them. We resolve those ids against the category/merchant contexts and surface the exact object as a `PRIMARY FACT TO ANCHOR ON` block — and force-include it in the slimmed context so truncation can never drop the fact the message must cite. This keeps Specificity + Trigger-relevance high, including on the post-submission digest injections.
 
-3. **Output validation**: Post-process enforces correct CTA enum (`yes_stop`/`open_ended`/`none`), strips markdown fences, and falls back gracefully if JSON parsing fails.
+3. **Context slimming**: We inject only the most relevant fields from each context (not the entire JSON) to keep token count low and focus the LLM's attention on actionable signals — merchant CTR, active offers, conversation history, peer stats, category voice.
+
+4. **Output validation + graceful degradation**: Post-process enforces the correct CTA enum (`yes_stop`/`open_ended`/`none`), extracts JSON via a balanced-brace scan (tolerant of trailing prose), and on total LLM failure emits a **context-aware** fallback that still names the merchant and the trigger reason — never a generic canned line.
 
 ### Compulsion Levers Used (per message)
 
@@ -26,11 +28,13 @@ We target at least **2 of 8** levers per message:
 
 ### Multi-turn Handling
 
-A `ConversationState` object tracks each conversation. On each `/v1/reply`:
-- **Auto-reply detection**: canned-phrase matching + exact-text repetition counter → graceful exit after 2 attempts.
-- **Intent detection**: regex patterns for "yes/haan/ok/go ahead" → switch to action mode immediately (no more qualifying questions).
+A `ConversationState` object tracks each conversation. On each `/v1/reply` the router checks, **in this order**:
 - **Exit detection**: "stop/not interested/nahi chahiye" → polite `action: end`.
-- **Normal replies**: forwarded to LLM with full conversation history (last 6 turns).
+- **Intent detection** (before auto-reply): "yes/haan/ok/go ahead/haan bhejo" → switch to action mode immediately. Intent is checked *before* the auto-reply heuristic, so short affirmatives are never misread as canned replies (the classic intent-handoff failure).
+- **Auto-reply detection**: known canned phrases **or** a verbatim repeat of the merchant's own earlier text → one soft retry, then graceful exit. Deliberately conservative — a false positive here silently kills a live conversation.
+- **Normal replies**: forwarded to the LLM with full conversation history (last 6 turns) and an explicit "never repeat a message verbatim / stay on-mission" instruction.
+
+An **anti-repetition guard** on every outbound reply ensures the bot never sends the same body twice in a conversation (the judge penalizes verbatim repeats).
 
 ### Language
 
@@ -38,7 +42,7 @@ Match `identity.languages` — Hindi-English code-mix preferred when `hi` in lan
 
 ### Model
 
-`llama-3.3-70b-versatile` on Groq. Temperature=0 for determinism. ~1.5–2.5s per call — comfortably within the 30s judge timeout.
+`llama-3.3-70b-versatile` on Groq, with `llama-3.1-8b-instant` as a rate-limit fallback. Temperature=0 for determinism. `/v1/tick` composes candidates **concurrently** (bounded worker pool, urgency-ordered) inside a 25s budget so a busy tick never blows the 30s judge timeout.
 
 ---
 

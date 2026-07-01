@@ -64,49 +64,84 @@ EXIT_PHRASES = [
 # Strong intent signals → switch to action mode
 INTENT_PHRASES = [
     r"\byes\b",
+    r"\byep\b",
+    r"\byeah\b",
+    r"\bsure\b",
     r"\bhaan\b",
+    r"\bhaanji\b",
+    r"\bhan\b",
     r"\bha\b",
+    r"\bji\b",
     r"\btheek hai\b",
+    r"\bthik hai\b",
     r"\bchalo\b",
+    r"\bchalega\b",
     r"\bkaro\b",
+    r"\bkar do\b",
+    r"\bkar dijiye\b",
     r"\bgo ahead\b",
     r"\blet'?s do\b",
+    r"\blets do\b",
     r"\bproceed\b",
     r"\bstart\b",
     r"\bsend\b",
+    r"\bsend it\b",
     r"\bbhejo\b",
+    r"\bbhej do\b",
     r"\bkijiye\b",
     r"\bi want\b",
+    r"\bi'?m interested\b",
+    r"\binterested\b",
     r"\bjoin\b",
     r"\bsign me up\b",
     r"\bdo it\b",
     r"\bok\b",
     r"\bokay\b",
+    r"\bplease\b",
+    r"\bpls\b",
+    r"\bset it up\b",
+    r"\bcall me\b",
 ]
+
+# Short affirmatives that must never be misread as an auto-reply or exit.
+SHORT_AFFIRMATIVES = {
+    "yes", "ok", "okay", "k", "haan", "haanji", "han", "ha", "ji", "hn",
+    "yep", "yeah", "sure", "done", "great", "cool", "thanks", "thank you",
+    "go", "go ahead", "do it", "send", "send it", "start", "proceed",
+    "theek hai", "thik hai", "chalo", "chalega", "kar do", "bhejo",
+}
 
 
 def is_auto_reply(message: str) -> bool:
-    """Return True if the message looks like a WhatsApp Business canned auto-reply."""
+    """Return True if the message looks like a WhatsApp Business canned auto-reply.
+
+    Conservative on purpose: a false positive here silently kills a live
+    conversation, so we only flag messages that match a known canned phrase.
+    Verbatim-repeat detection (in decide_on_reply) catches the rest — a genuine
+    auto-reply repeats the same text, a real merchant does not.
+    """
     msg_lower = message.lower().strip()
-    # Check against known phrases
+    if msg_lower in SHORT_AFFIRMATIVES:
+        return False
     for phrase in AUTO_REPLY_PHRASES:
         if phrase in msg_lower:
             return True
-    # Very short, non-question messages that look like acks (<15 chars, no ?)
-    if len(msg_lower) < 15 and "?" not in msg_lower and msg_lower not in ("yes", "ok", "haan", "ha"):
-        return True
     return False
 
 
 def is_exit_signal(message: str) -> bool:
     """Return True if merchant/customer wants to disengage."""
-    msg_lower = message.lower()
+    msg_lower = message.lower().strip()
+    if msg_lower in SHORT_AFFIRMATIVES:
+        return False
     return any(phrase in msg_lower for phrase in EXIT_PHRASES)
 
 
 def is_intent_signal(message: str) -> bool:
     """Return True if merchant has given a clear go-ahead."""
-    msg_lower = message.lower()
+    msg_lower = message.lower().strip()
+    if msg_lower in SHORT_AFFIRMATIVES:
+        return True
     return any(re.search(pattern, msg_lower) for pattern in INTENT_PHRASES)
 
 
@@ -151,31 +186,43 @@ def decide_on_reply(
     Without calling the LLM, determine if we can make a routing decision.
 
     Returns:
-        {"decision": "auto_reply" | "exit" | "intent" | "normal" | "close_after_retry"}
+        {"decision": "auto_reply_retry" | "exit" | "intent" | "normal" | "close_after_retry"}
+
+    Order matters: a clear go-ahead ("ok let's do it") must win over the
+    auto-reply heuristic, otherwise we ask another qualifying question — the
+    exact intent-handoff failure the challenge penalizes.
     """
-    # Check for exit signal first
+    # 1) Explicit disengagement always wins.
     if is_exit_signal(merchant_message):
         return {"decision": "exit"}
 
-    # Check for auto-reply
-    if is_auto_reply(merchant_message):
-        # Check if this is the same message as last time (verbatim repeat)
-        is_repeat = merchant_message.strip() == state.turns[-2].get("message", "").strip() if len(state.turns) >= 2 else False
-        state.auto_reply_count += 1
+    # 2) A verbatim repeat of what the human already said = canned auto-reply,
+    #    regardless of content. Look back over prior human turns, not just [-2].
+    prior_human = [
+        t.get("message", "").strip()
+        for t in state.turns[:-1]
+        if t.get("from") not in ("vera", "merchant_on_behalf")
+    ]
+    is_repeat = merchant_message.strip() != "" and merchant_message.strip() in prior_human
 
-        if state.auto_reply_count >= 2 or is_repeat:
-            # Second auto-reply → give up gracefully
-            return {"decision": "close_after_retry"}
-        else:
-            # First auto-reply → try once more
-            return {"decision": "auto_reply_retry"}
-
-    # Check for strong intent → switch to action mode
-    if is_intent_signal(merchant_message) and state.state in (ConvState.OPENING, ConvState.ENGAGED):
+    # 3) Clear intent → action mode (checked BEFORE the auto-reply heuristic so
+    #    short affirmatives like "go ahead" / "haan bhejo" route correctly).
+    if not is_repeat and is_intent_signal(merchant_message) and state.state in (
+        ConvState.OPENING,
+        ConvState.ENGAGED,
+        ConvState.WAITING,
+    ):
         state.transition(ConvState.ACTION_MODE)
         return {"decision": "intent"}
 
-    # Normal reply — send to LLM
+    # 4) Canned auto-reply (known phrase or verbatim repeat).
+    if is_repeat or is_auto_reply(merchant_message):
+        state.auto_reply_count += 1
+        if state.auto_reply_count >= 2 or is_repeat:
+            return {"decision": "close_after_retry"}
+        return {"decision": "auto_reply_retry"}
+
+    # 5) Anything else → let the LLM handle it with full context.
     return {"decision": "normal"}
 
 
