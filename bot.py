@@ -26,6 +26,7 @@ from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel
 
 from composer import compose, compose_reply
+from llm import active_model_label
 from conversation_handlers import (
     ConversationState,
     ConvState,
@@ -133,9 +134,10 @@ async def metadata():
     return {
         "team_name": "VeraPlus",
         "team_members": ["Anamika"],
-        "model": "llama-3.3-70b-versatile (Groq)",
+        "model": active_model_label(),
         "approach": (
-            "Trigger-routed single-prompt composer on Groq LLaMA-3.3-70B. "
+            "Trigger-routed single-prompt composer with a pluggable LLM provider "
+            "(Groq default; OpenAI/Anthropic/Gemini swappable via env). "
             "Each trigger kind gets a specialized instruction, and the exact fact a "
             "trigger references (digest/offer/content id) is resolved and surfaced as "
             "the anchor so composition never loses the concrete number. Multi-turn: "

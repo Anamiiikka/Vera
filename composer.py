@@ -1,33 +1,18 @@
 """
-composer.py — Vera message composer using Groq (LLaMA 3.3-70B)
+composer.py — Vera message composer.
 
 compose(category, merchant, trigger, customer?) → {body, cta, send_as, suppression_key, rationale}
+
+The LLM provider is pluggable via env vars (see llm.py). Groq is the default.
 """
 
 from __future__ import annotations
 
 import json
-import os
 import re
-import time
 from typing import Any
 
-from groq import Groq
-from dotenv import load_dotenv
-
-load_dotenv()
-
-_client: Groq | None = None
-
-# Model cascade: try fast 70B first; if rate-limited, fall back to 8B instant
-MODELS = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
-
-def _get_client() -> Groq:
-    global _client
-    if _client is None:
-        api_key = os.environ.get("GROQ_API_KEY", "")
-        _client = Groq(api_key=api_key)
-    return _client
+from llm import complete_json
 
 
 # ── Trigger-type routing: short instruction appended per kind ─────────────────
@@ -390,35 +375,13 @@ def compose(
     Inputs are dicts loaded from the dataset JSON.
     Returns: {body, cta, send_as, suppression_key, rationale}
     """
-    client = _get_client()
     user_prompt = _build_user_prompt(category, merchant, trigger, customer, conversation_history)
-
-    last_exc = None
-    for model in MODELS:
-        try:
-            response = client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": user_prompt},
-                ],
-                temperature=0.0,
-                max_tokens=600,
-                response_format={"type": "json_object"},
-            )
-            raw = response.choices[0].message.content or ""
-            return _parse_llm_output(raw, trigger, merchant, category, customer)
-        except Exception as e:
-            err_str = str(e)
-            if "rate_limit" in err_str or "429" in err_str:
-                print(f"[WARN] {model} rate-limited, trying next model...")
-                last_exc = e
-                time.sleep(1)
-                continue
-            raise
-    # All models exhausted — degrade gracefully instead of 500-ing the tick.
-    print(f"[WARN] all models exhausted for {trigger.get('id')}: {last_exc}")
-    return _context_aware_fallback(trigger, merchant, category, customer)
+    try:
+        raw = complete_json(SYSTEM_PROMPT, user_prompt, max_tokens=600)
+        return _parse_llm_output(raw, trigger, merchant, category, customer)
+    except Exception as e:  # degrade gracefully instead of 500-ing the tick
+        print(f"[WARN] compose failed for {trigger.get('id')}: {e}")
+        return _context_aware_fallback(trigger, merchant, category, customer)
 
 
 def compose_reply(
@@ -433,8 +396,6 @@ def compose_reply(
     Compose a reply to a merchant's message within an ongoing conversation.
     Returns same schema as compose().
     """
-    client = _get_client()
-
     # Build a reply-specific prompt
     history_text = "\n".join(
         f"  [{t.get('from', t.get('from_role', '?')).upper()}]: {t.get('body', t.get('msg', t.get('message', '')))}"
@@ -469,31 +430,15 @@ If action is "wait", add "wait_seconds": <integer>.
 If action is "end", body is optional (brief polite close).
 """
 
-    last_exc = None
-    response = None
-    for model in MODELS:
-        try:
-            response = client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": user_prompt},
-                ],
-                temperature=0.0,
-                max_tokens=400,
-                response_format={"type": "json_object"},
-            )
-            break
-        except Exception as e:
-            err_str = str(e)
-            if "rate_limit" in err_str or "429" in err_str:
-                last_exc = e
-                time.sleep(1)
-                continue
-            raise
+    raw = None
+    try:
+        raw = complete_json(SYSTEM_PROMPT, user_prompt, max_tokens=400)
+    except Exception as e:
+        print(f"[REPLY WARN] compose_reply failed: {e}")
+
     lang = _lang_of(merchant, customer)
-    if response is not None:
-        result = _extract_json(response.choices[0].message.content or "")
+    if raw is not None:
+        result = _extract_json(raw)
         if isinstance(result, dict) and (
             result.get("action") in ("send", "wait", "end") or (result.get("body") or "").strip()
         ):

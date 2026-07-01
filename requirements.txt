@@ -4,3 +4,9 @@ groq>=0.5.0
 pydantic>=2.0.0
 httpx>=0.27.0
 python-dotenv>=1.0.0
+# Optional LLM providers — enabled by setting LLM_PROVIDER (see llm.py).
+# Safe to keep installed; Groq stays the default and these stay dormant.
+openai>=1.30.0
+anthropic>=0.40.0
+# Gemini (uncomment if LLM_PROVIDER=gemini):
+# google-genai>=0.3.0
